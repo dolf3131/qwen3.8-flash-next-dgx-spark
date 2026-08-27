@@ -49,7 +49,7 @@ fi
 # 4) implies, because the verify pass covers k+1 tokens in one forward and so divides the
 # per-step PLE round trip by k+1.
 #   SPEC=none ./serve.sh    # unspeculated baseline, 17.4 tok/s
-NSPEC="${NSPEC:-3}"
+NSPEC="${NSPEC:-2}"
 case "${SPEC:-mtp}" in
   mtp)  SPEC_CFG="{\"method\":\"mtp\",\"num_speculative_tokens\":${NSPEC}}" ;;
   none) SPEC_CFG='' ;;
@@ -73,6 +73,25 @@ KV_ARGS=()
 # left KV at 0.21 GiB and refused to boot.
 GPU_UTIL="${GPU_UTIL:-0.78}"
 MAXSEQS="${MAXSEQS:-8}"
+
+# Pin the KV pool: vLLM derives it from a runtime measurement that wobbles on unified
+# memory (three boots of one config gave 573,862 / 591,889 / 614,423 tokens). 15.0 GiB
+# leaves ~5% over the 14.3 GiB one 524288 request needs. KV_MEM= restores the old behaviour.
+KV_MEM="${KV_MEM-16106127360}"
+KVMEM_ARGS=()
+[[ -n "${KV_MEM}" ]] && KVMEM_ARGS=(--kv-cache-memory "${KV_MEM}")
+
+# Prefix caching needs BOTH flags on this hybrid model: without align the GDN state is not
+# cacheable and the hit rate is 0 regardless of traffic. With align the attention block
+# size becomes 1600 tokens, so only prompts longer than that can hit. Off by default
+# because it only pays on repeated prefixes; see the README.
+PREFIX_CACHE="${PREFIX_CACHE:-0}"
+PREFIX_ARGS=()
+[[ "${PREFIX_CACHE}" == "1" ]] && PREFIX_ARGS=(--enable-prefix-caching --mamba-cache-mode align)
+
+# NEVER enable --async-scheduling with MTP: it makes _prepare_ngram_context read the
+# optimistic -1 placeholders speculative decoding writes, so the n-gram context is wrong on
+# every decode step. Silent quality loss, no crash. See the README.
 
 # Loading 95.37 GiB into the offload process, most of it straight back out to swap, does
 # not finish inside the 600 s default.
@@ -118,12 +137,13 @@ docker run -d \
     --distributed-executor-backend "${EXECUTOR}" \
     "${KV_ARGS[@]}" \
     --gpu-memory-utilization "${GPU_UTIL}" \
+    "${KVMEM_ARGS[@]}" \
     --max-model-len "${MAXLEN}" \
     "${ROPE_ARGS[@]}" \
     --max-num-seqs "${MAXSEQS}" \
     --max-num-batched-tokens "${BATCHED_TOKENS:-8192}" \
     --enable-chunked-prefill \
-    --enable-prefix-caching \
+    "${PREFIX_ARGS[@]}" \
     --no-enable-flashinfer-autotune \
     --enable-auto-tool-choice \
     --tool-call-parser qwen3_coder \

@@ -17,9 +17,11 @@ image tag — see [Versions](#versions) before assuming any of it still holds.
 | Resident on GPU | 76.3 GiB weights + ~16 GiB KV |
 | Paged to swap | 95.37 GiB (the n-gram / PLE table) |
 | Context | 524288 (YaRN factor 2 over the native 262144) |
-| Speculation | in-checkpoint MTP, k=3 |
-| **Decode** | **30.0 tok/s** (single stream, short prompt, reasoning on) |
-| TTFT | 366–425 ms warm |
+| Speculation | in-checkpoint MTP, k=2 |
+| **Decode** | **28.2 tok/s** warm, 26.9 first run after boot |
+| **Prefill** | **2,719 tok/s** at 30k tokens |
+| Repeated prefix | TTFT **5.4x** better with prefix caching (see below — needs two flags, not one) |
+| TTFT | 280–390 ms warm on short prompts |
 
 **The single thing most likely to cost you a day:** PLE CPU offload silently hangs at
 TP=1. Jump to [The trap](#the-trap-ple-offload-hangs-at-tp1).
@@ -126,8 +128,10 @@ download.
 | `RadixArk/Qwen3.8-Flash-Next-NVFP4` | 126.0 GiB | FP8 (47.7 GiB) | no |
 | `Qwen/Qwen3.8-Flash-Next-FP8` | 172.8 GiB | FP8 | body alone is ~125 GiB |
 
-RadixArk looks strictly better — 44 GiB less to download and half the swap — but vLLM
-selects its FP8 PLE path only for an `Fp8Config` checkpoint:
+RadixArk looks strictly better — 44 GiB less to download and half the swap — and its PLE
+is a faithful quantization of the official BF16 table (cosine 0.9996, verified by another
+operator against the source rows). It is rejected because vLLM selects its FP8 PLE path
+only for an `Fp8Config` checkpoint:
 
 ```python
 # vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
@@ -140,6 +144,15 @@ def _get_ple_embedding_quant_method(quant_config, prefix):
 RadixArk is `modelopt`/NVFP4, so the PLE would be built unquantized and its FP8 tensors
 would not load into a BF16 parameter. Qwen's own FP8 build has the PLE that path wants,
 but a ~125 GiB body that does not fit at all.
+
+**Correction, 2026-08-27:** RadixArk *does* load if that gate is widened to accept
+modelopt — but it then emits garbage, which is still being bisected
+([issue #1](../../issues/1), with ~20 hypotheses eliminated there and here). So the
+practical answer is unchanged, but "does not load" was the wrong reason. The one isolated
+difference found so far: RadixArk excludes `*.self_attn.*` as a wildcard, leaving the QSA
+`q/k/v/o_proj` in BF16, while Inferact quantizes them and excludes only 117 `self_attn`
+norm/indexer sub-modules. That accounts for the full 2.5 B-parameter gap between the two
+bodies, though it is the wrong direction to explain corruption on its own.
 
 So: **Inferact**, which is also what the vLLM recipe recommends.
 
@@ -171,43 +184,98 @@ to give either: the experts are already NVFP4 and only ~11 GiB is BF16.
 
 ## Measurements
 
-`bench_vllm.py`-style harness: four prompts, streaming, decode isolated from TTFT by
-timing between the first and last chunk. **Short prompts (~30–50 tokens, so essentially
-zero prefill), `temperature: 0`, `max_tokens: 600`, single stream, reasoning ON**
-(the checkpoint's chat template defaults to `reasoning_effort: xhigh`).
+Decode: four prompts, streaming, decode isolated from TTFT by timing between the first and
+last chunk. **Short prompts (~40–90 tokens, so essentially zero prefill), `temperature: 0`,
+`max_tokens: 600`, single stream, reasoning ON** (the checkpoint's chat template defaults to
+`reasoning_effort: xhigh`). Prefill: long prompts of real prose/code with `max_tokens: 1`,
+measured as `prompt_tokens / TTFT`.
 
-| config | mean tok/s | four prompts | RAM used / avail |
-|---|---|---|---|
-| 262144, no speculation | 17.4 | 17.41 / 17.49 / 17.32 / 17.41 | — |
-| 262144, MTP-3 | 29.3 | 25.37 / 35.31 / 26.09 / 30.34 | — |
-| 1M, MTP-3 | 27.4 | 25.90 / 29.73 / 25.63 / 28.15 | 119–120 / 1–2 GiB |
-| **524288, MTP-3** | **30.0** | 31.21 / 32.71 / 24.77 / 31.47 | **104–106 / 15 GiB** |
+### Decode
 
-TTFT 366–425 ms warm, 1.1–3.7 s cold. Mean acceptance length 2.2–3.7 of a possible 4.
+| config | tok/s (first run / warm) | mean acceptance |
+|---|---|---|
+| 262144, no speculation | 17.4 | — |
+| 1M, MTP-3 | 27.4 | 2.81 |
+| 524288, MTP-3 | 26.0 / 27.3 | 2.42 |
+| **524288, MTP-2** | **26.9 / 28.2** | 2.14 |
 
-### Two results worth explaining
+**A number in an earlier version of this file did not survive re-measurement.** The 524288
+MTP-3 row was first recorded at 30.0 tok/s. Three further boots of that identical
+configuration produced 26.0 / 27.3 with byte-identical streamed-chunk counts — the same
+generated sequence every time — while the original boot produced a different sequence with
+acceptance 2.81. It has not recurred in three attempts and I cannot explain it. The
+reproducible figures are the ones above; treat single-boot numbers on this model with
+suspicion, including anyone else's.
 
-**MTP-3 is worth 1.72x, and 3 is the right k.** vLLM logs per-position acceptance; over
-14,343 drafts this configuration gives **0.750 / 0.553 / 0.411**, decaying by a steady
-factor of 0.74 per position. Solving the two measured points (17.4 unspeculated, 30.0 at
-k=3) for the draft cost puts one MTP forward at **12% of a target forward**, which makes
-the rest of the curve computable:
+Within a boot the benchmark is perfectly deterministic (identical chunk counts across runs);
+across boots the generated sequence can differ, and since throughput is
+`acceptance x step rate`, a sequence difference moves the headline number by ~10% without
+anything being wrong.
+
+### Prefill
+
+| prompt | TTFT | prefill |
+|---|---|---|
+| 8,068 tok | 3.72 s | 2,171 tok/s |
+| 16,539 tok | 7.50 s | 2,206 tok/s |
+| 30,054 tok | 11.05 s | **2,719 tok/s** |
+
+Prefill is the axis where this model's sparse attention pays off, and it is the reason to
+be on vLLM rather than a GGUF at all — QSA prefill kernels do not exist in llama.cpp.
+
+## Two results worth explaining
+
+**MTP: k=2, not k=3.** vLLM logs per-position acceptance. Over 5,928 drafts at k=3 this
+configuration gives **0.682 / 0.445 / 0.299**, decaying by a steady factor of 0.66 per
+position. Solving the two measured points (17.4 unspeculated, 27.5 at k=3) for the draft
+cost puts one MTP forward at **10.5% of a target forward**, which makes the curve computable:
 
 | k | 1 | 2 | 3 | 4 | 5 |
 |---|---|---|---|---|---|
-| expected tok/s | 27.2 | 30.5 | **30.0** | 28.2 | 26.2 |
+| predicted tok/s | 26.5 | **28.6** | 27.5 | 25.7 | 24.0 |
 
-Raising k *costs* throughput. Position 4 is worth only 0.75 x 0.553 x 0.411 x 0.305 =
-0.05 expected tokens against 12% more step cost per position. The card calling the MTP
-layer "trained with multi-steps" makes larger k permissible, not profitable. k=2 lands
-inside this box's per-prompt scatter, so it is a wash against 3.
+Predicted +3.9% for k=2 over k=3; **measured +3.1% warm and +3.4% cold**. Position 3 earns
+only `0.682 x 0.445 x 0.299 = 0.09` expected tokens against 10.5% more step cost, so k=3 is
+already past the optimum. The card calling the MTP layer "trained with multi-steps" makes
+larger k permissible, not profitable.
 
-**512K is faster than 1M.** Dropping 1M → 512K frees 17.7 GiB of KV. That RAM does not
-show up as "free" — it becomes **page cache for the PLE table** (15 GiB of it), and decode
-gets faster for it: 30.0 against 27.4. The n-gram lookups hit RAM more often instead of
-NVMe. If you are memory-constrained, shortening context is not purely a sacrifice here.
+**512K is faster than 1M.** Dropping 1M → 512K frees 17.7 GiB of KV. That RAM does not show
+up as "free" — it becomes page cache for the PLE table — and decode gets faster for it. Note
+the effect does not scale down linearly: pinning the KV pool later returned a further
+1.6 GiB and produced no measurable gain, so page cache is not a lever you can keep pulling.
 
----
+## Configuration notes that cost real time
+
+**`--async-scheduling`: do not enable it with MTP.** Reported upstream on 2026-08-27
+(PR #53896): under async scheduling `_prepare_ngram_context` reads the CPU token mirror
+while it still holds the optimistic `-1` placeholders that speculative decoding writes
+before acceptance is known, so the n-gram context is wrong on **every** decode step — 154 of
+154 measured bad in that report. It is a silent quality loss, not a crash: the 51B n-gram
+table is fed garbage ids and no benchmark will show it.
+
+**Prefix caching needs two flags.** `--enable-prefix-caching` alone is inert on this model:
+`mamba_cache_mode` defaults to `"none"` and nothing promotes it, so the GDN state is never
+cacheable and blocks are never reusable. Measured that way: **0 hits in 813 queries**. With
+`--mamba-cache-mode align` the attention block size is forced to **1600 tokens** to match the
+mamba page size, so any prompt shorter than 1600 tokens still cannot hit — which is why
+short-prompt benchmarks report 0% and conclude the feature is broken. With both flags and an
+8,053-token prompt repeated:
+
+| request | TTFT | prefill | hits |
+|---|---|---|---|
+| 1 | 5.41 s | 1,497 tok/s | 0 |
+| 2 | 3.81 s | 2,128 tok/s | 0 |
+| 3 | **1.01 s** | **8,015 tok/s** | **6,400 tokens** |
+
+Decode is unaffected (28.19 without, 28.25 with). Another GB10 operator reports the
+cached-block path crashing a GDN `in_proj` GEMM with `CUBLAS_STATUS_INTERNAL_ERROR`; that did
+not reproduce here with `align` set, and may be the half-enabled configuration above.
+
+**Pin the KV pool.** vLLM sizes KV as `(util x total)` minus a *runtime measurement* of
+consumed memory, and on unified memory that measurement wobbles with whatever the page cache
+and the offload worker happen to hold. Three boots of one identical config produced
+573,862 / 591,889 / 614,423 tokens. `--kv-cache-memory` makes it deterministic; the excess is
+dead weight, since one 524288 request needs ~14.3 GiB at the measured 28.6 KiB/token.
 
 ## Reproducing
 
@@ -234,9 +302,16 @@ the API answers. The PLE worker loads and swaps out first; the GPU worker follow
 Useful knobs, all environment variables on `serve.sh`:
 
 ```bash
-MAXLEN=1048576 GPU_UTIL=0.91 ./scripts/serve.sh   # 1M, leaves ~1-2 GiB free
-SPEC=none ./scripts/serve.sh                      # unspeculated baseline
-NSPEC=5 ./scripts/serve.sh                        # MTP k=5
+MAXLEN=1048576 GPU_UTIL=0.91 KV_MEM= ./scripts/serve.sh  # 1M, leaves ~1-2 GiB free
+SPEC=none ./scripts/serve.sh                            # unspeculated baseline
+NSPEC=3 ./scripts/serve.sh                              # MTP k=3 (k=2 is the default)
+PREFIX_CACHE=1 ./scripts/serve.sh                       # + --mamba-cache-mode align
+```
+
+Measuring:
+
+```bash
+BENCH_MODEL=qwen3.8-flash-next python3 scripts/bench-prefill.py   # prefill tok/s by ctx
 ```
 
 ---
@@ -268,13 +343,20 @@ This is not an optimized configuration. Things that are open:
   unverified for this architecture, which matters most with reasoning left at `xhigh`,
   where degradation shows up as non-termination rather than as a wrong answer.
 - **Concurrency is untested past `max-num-seqs 8`.**
-- **Prefix caching is on but its hit rate was not measured here.**
+- **The 5.4x prefix-caching win was measured on one repeated prompt**, not on a realistic
+  agent or multi-turn trace, and hits only appeared on the third identical request.
 - **Attention backends and kernels were not swept.** FlashInfer autotune is explicitly
   disabled (`--no-enable-flashinfer-autotune`) to keep cold boot short.
 - **Long-context retrieval was not verified.** 524288 is YaRN factor 2 over the native
   262144; the card sanctions up to 1M, but no needle test was run here.
 - **`temperature: 0` in the benchmark** does not match the card's recommendation of 1.0
   for thinking mode. It was chosen for measurement stability, not quality.
+- **Boot-to-boot sequence variation is unexplained.** Identical configurations sometimes
+  generate a different continuation, which moves decode throughput by ~10% through
+  acceptance length. Ruled out: executor choice, KV pool size, prefix caching, the image.
+- **Nothing here is profiled.** The per-step CPU→GPU PLE round trip is the leading suspect
+  for decode being ~30 tok/s against a ~90 tok/s bandwidth ceiling, but that is an
+  inference from the arithmetic, not a measurement.
 
 ---
 
