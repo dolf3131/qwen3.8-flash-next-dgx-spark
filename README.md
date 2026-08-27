@@ -187,12 +187,20 @@ TTFT 366–425 ms warm, 1.1–3.7 s cold. Mean acceptance length 2.2–3.7 of a 
 
 ### Two results worth explaining
 
-**MTP is worth 1.68x, more than its acceptance length implies.** With a mean acceptance
-of ~2.5 you would expect roughly 2x from compute alone, and the usual story is that you
-get somewhat less. Here you get more relative to the unspeculated baseline than the PLE
-overhead would allow otherwise, because **the verify pass covers k+1 tokens in a single
-forward and therefore divides the per-step PLE round trip by k+1**. On a model whose
-bottleneck is a synchronous CPU gather every step, speculation buys more than usual.
+**MTP-3 is worth 1.72x, and 3 is the right k.** vLLM logs per-position acceptance; over
+14,343 drafts this configuration gives **0.750 / 0.553 / 0.411**, decaying by a steady
+factor of 0.74 per position. Solving the two measured points (17.4 unspeculated, 30.0 at
+k=3) for the draft cost puts one MTP forward at **12% of a target forward**, which makes
+the rest of the curve computable:
+
+| k | 1 | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| expected tok/s | 27.2 | 30.5 | **30.0** | 28.2 | 26.2 |
+
+Raising k *costs* throughput. Position 4 is worth only 0.75 x 0.553 x 0.411 x 0.305 =
+0.05 expected tokens against 12% more step cost per position. The card calling the MTP
+layer "trained with multi-steps" makes larger k permissible, not profitable. k=2 lands
+inside this box's per-prompt scatter, so it is a wash against 3.
 
 **512K is faster than 1M.** Dropping 1M → 512K frees 17.7 GiB of KV. That RAM does not
 show up as "free" — it becomes **page cache for the PLE table** (15 GiB of it), and decode
