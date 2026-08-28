@@ -311,6 +311,27 @@ Measured per-shape, at M=1 (drafts) / M=3 (verify):
 end this is worth **+6.9% on the step rate**, reproduced across three boots. The microbench
 predicted +17%; isolated timing loops flatter the kernel, so trust the end-to-end number.
 
+**The configs above are not worth re-tuning, and the reason is worth stating.** Four rounds
+tried: M=2/4/8 on a coarse grid; adding `(10240, 320)`; a wide grid at M=1/4; and a wide grid
+sweeping M=1/2/3/4/8 separately, keeping only entries individually measured faster than
+cuBLAS. Every round won 1.3-2.3x in the microbenchmark. Every round moved the end-to-end step
+rate by 0.0-0.4% -- inside boot-to-boot noise. Two things were wrong with the method:
+
+- *The microbenchmark is L2-resident.* It calls one shape in a loop, so the weights never
+  leave cache. Its "best" numbers are faster than this machine can physically read the
+  weights: `(10240, 2560)` is 52.4 MiB, needing 192 us at 273 GB/s, and the microbenchmark
+  reports 164 us. In a real forward those weights are cold every time and the GEMM is
+  bandwidth-bound, so the config cannot move it. Any candidate timing below `N*K*2 / 273 GB/s`
+  is measuring cache, not the kernel.
+- *A large ratio on a small weight is nothing.* `(2560, 640)` wins 1.32x on a 110 us/forward
+  budget. Only entries with a large ratio **and** a large call-weight are worth listing.
+
+Two side findings, in case they save someone a sweep: `static_k` appears in nearly every
+winning config and omitting it made M>=2 look structurally useless; and the kernel requires
+K divisible by `block_size * vector_width`, so `K=320` has no valid config above
+`vector_width=2` -- omitting widths 1 and 2 made `(10240, 320)` look unsupported. Both of
+those were wrong conclusions this repo held at one point.
+
 This is a patch, not a fix. It is TP=1-specific and it overrides one existing plan key, so
 do not carry it into a multi-GPU deployment. It exists because GB10 is not in vLLM's CI and
 nobody upstream appears to have one — the TP=4 plans are there because somebody tuned on a
@@ -410,9 +431,10 @@ This is not an optimized configuration. Things that are open:
   and the part of that reachable without touching kernels has been taken. What is left needs
   either quantised attention/GDN weights (a checkpoint that does not exist, and a quality
   question), or upstream kernel work.
-- **The skinny-GEMM configs were swept coarsely.** A finer grid over
-  `block_size x outputs_per_block x k_unroll x vector_width`, and a second look at
-  `(640, 2560)` at M=1, could plausibly find more.
+- ~~**The skinny-GEMM configs were swept coarsely.**~~ Closed: a wide grid over
+  `block_size x outputs_per_block x k_unroll x vector_width x static_k`, run separately at
+  M=1/2/3/4/8, found much better microbenchmark configs and no end-to-end gain at all. These
+  GEMMs are already at the memory roofline in a real forward; see the note above.
 - **FP8 KV is not enabled**, and enabling it is a kernel project, not a flag. The stock
   tree refuses it in four places — `supported_kv_cache_dtypes = ["auto", "bfloat16"]` in
   both `nvidia/qsa.py:70` and `common/qsa_cache.py:658`, plus two `NotImplementedError`s

@@ -44,7 +44,12 @@ GATE_REPL = """def _is_sm103() -> bool:
 
 PLANS_ANCHOR = "def _is_sm103() -> bool:"
 PLANS_EXTRA = '''# --- local patch: TP=1 shapes for a single GB10, measured against F.linear ---
-# speedups at (M=1 / M=3): see the module docstring for how these were found.
+# Only entries that beat cuBLAS by a LARGE margin are listed, and that restraint is
+# load-bearing. A version of this table covering the CUDA graph capture sizes
+# ({1, 2, 4, 8}) as well measured 1.5% SLOWER end to end: at those sizes the kernel wins
+# by only 1.00-1.11x in a microbenchmark, the microbenchmark overstates the real gain by
+# roughly 2.5x (M=1 measured 1.43x there and 1.069x end to end), and what is left does not
+# cover the custom-op dispatch. Marginal wins are worth less than nothing here.
 QWEN38NEXT_GEMM_PLANS.update(
     {
         # GDN fused in_proj, x36 per forward. 1.43x / 1.05x
@@ -76,6 +81,14 @@ QWEN38NEXT_GEMM_PLANS.update(
         (640, 2560): {
             3: SkinnyGemmConfig(3, 128, 2, k_unroll=4, vector_width=4),
         },
+        # NOT included, and the reason is worth keeping: (10240, 320), x97 per forward,
+        # measures 1.70x at M=1 -- but adding it made no difference end to end (step rate
+        # 13.86 against v1's 13.95-14.09 band). At 6.2 MiB per call the absolute saving is
+        # ~2.7 us after the microbenchmark's ~2.5x optimism, which the custom-op dispatch
+        # eats. What the entries below have in common is a large ratio AND a large weight:
+        # ratio alone does not survive. Also note K=320 needs vector_width 1 or 2, since
+        # the kernel wants K divisible by block_size * vector_width -- a sweep that omits
+        # those concludes the shape is unsupported, which is how it was first missed.
         # LM head, x1 per forward but 1.27 GiB of weights. 1.40x / 1.05x
         (248320, 2560): {
             1: SkinnyGemmConfig(1, 128, 1, k_unroll=4, vector_width=4),
@@ -83,6 +96,21 @@ QWEN38NEXT_GEMM_PLANS.update(
         },
     }
 )
+#
+# Do not re-tune these configs against the standalone microbenchmark. Four attempts
+# (M=2/4/8 coarse grid; adding (10240, 320); M=1/4 wide grid; M=1/2/3/4/8 wide grid, each
+# entry individually verified faster) all measured a 1.3-2.3x microbenchmark win and all
+# moved the end-to-end decode step by 0.0-0.4%, which is inside boot-to-boot noise.
+#
+# The reason: the microbenchmark calls one shape in a loop, so its weights stay resident in
+# L2. Every "winning" config above is faster than this machine can even read the weights --
+# (10240, 2560) is 52.4 MiB, which needs 192 us at 273 GB/s, and the microbenchmark reports
+# 164 us. In a real forward the weights are cold every time and the GEMM is bandwidth-bound,
+# so config choice cannot move it. The table below is what the shape-level dispatch is
+# worth; the remaining decode time is not in these GEMMs.
+#
+# Compare candidates by STEP RATE (tok/s divided by tokens-per-chunk), never by tok/s:
+# MTP acceptance length shifts between boots and swamps the effect being measured.
 # --- end local patch ---
 
 
