@@ -1,0 +1,9 @@
+# Stock Flash-Next image + the TP=1 skinny-GEMM enablement patch.
+#   docker build -t vllm-skinny-tp1:v1 -f scripts/Dockerfile.skinny-gemm scripts/
+# The patch asserts its own anchors, so this build fails loudly if upstream moves the
+# code rather than silently shipping an unpatched image.
+FROM vllm/vllm-openai:qwen38-flash-next-arm64-cu130
+COPY patch-skinny-gemm-tp1.py /tmp/p.py
+RUN python3 /tmp/p.py \
+ && python3 -c "import ast,glob; f=glob.glob('/usr/local/lib/python3.*/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/low_latency_gemm.py')[0]; s=open(f).read(); ast.parse(s); assert '(248320, 2560)' in s and '(12, 1)' in s; print('patched')" \
+ && rm /tmp/p.py

@@ -18,8 +18,10 @@ image tag — see [Versions](#versions) before assuming any of it still holds.
 | Paged to swap | 95.37 GiB (the n-gram / PLE table) |
 | Context | 524288 (YaRN factor 2 over the native 262144) |
 | Speculation | in-checkpoint MTP, k=2 |
-| **Decode** | **28.2 tok/s** warm, 26.9 first run after boot |
+| Engine | stock image **plus one local patch** that unblocks vLLM's own fast decode GEMM (below) |
+| **Decode** | **32.7 tok/s** warm, 30.9 first run after boot |
 | **Prefill** | **2,719 tok/s** at 30k tokens |
+| Concurrency | ~102 tok/s aggregate at 8 concurrent requests |
 | Repeated prefix | TTFT **5.4x** better with prefix caching (see below — needs two flags, not one) |
 | TTFT | 280–390 ms warm on short prompts |
 
@@ -192,12 +194,18 @@ measured as `prompt_tokens / TTFT`.
 
 ### Decode
 
-| config | tok/s (first run / warm) | mean acceptance |
-|---|---|---|
-| 262144, no speculation | 17.4 | — |
-| 1M, MTP-3 | 27.4 | 2.81 |
-| 524288, MTP-3 | 26.0 / 27.3 | 2.42 |
-| **524288, MTP-2** | **26.9 / 28.2** | 2.14 |
+| config | tok/s (first run / warm) | steps/s | mean acceptance |
+|---|---|---|---|
+| 262144, no speculation | 17.4 | — | — |
+| 1M, MTP-3 | 27.4 | — | 2.81 |
+| 524288, MTP-3 | 26.0 / 27.3 | 12.3 | 2.42 |
+| 524288, MTP-2 | 26.9 / 28.2 | 13.19 | 2.14 |
+| **524288, MTP-2, skinny-GEMM patch** | **30.9 / 32.7** | **14.04** | 2.33 |
+
+**Compare configurations by steps/s, not tok/s.** Throughput is `acceptance x step rate`,
+and acceptance wanders between boots of one identical config (2.14–2.33 observed), moving
+tok/s by ~10% with nothing actually different. The three patched boots gave 14.11 / 14.06 /
+14.04 steps/s; the tok/s from those same boots ranged 30.4–32.8.
 
 **A number in an earlier version of this file did not survive re-measurement.** The 524288
 MTP-3 row was first recorded at 30.0 tok/s. Three further boots of that identical
@@ -234,15 +242,77 @@ cost puts one MTP forward at **10.5% of a target forward**, which makes the curv
 |---|---|---|---|---|---|
 | predicted tok/s | 26.5 | **28.6** | 27.5 | 25.7 | 24.0 |
 
-Predicted +3.9% for k=2 over k=3; **measured +3.1% warm and +3.4% cold**. Position 3 earns
-only `0.682 x 0.445 x 0.299 = 0.09` expected tokens against 10.5% more step cost, so k=3 is
-already past the optimum. The card calling the MTP layer "trained with multi-steps" makes
-larger k permissible, not profitable.
+Predicted +3.9% for k=2 over k=3; **measured +3.1% warm and +3.4% cold**.
+
+The draft cost is better measured directly than fitted: the step-time difference between
+k=2 and k=3 on otherwise identical builds is **10.1 ms, or 20% of the verify forward** —
+twice what the curve fit above implied. With that number, k=3 buys +10.7% acceptance for
++14.2% step time, a net **-3.0%**. This still holds after the GEMM patch below, even though
+that patch helps the M=1 drafts more than the M=3 verify and should therefore shift the
+optimum upward. k=2 and k=3 are within the boot-to-boot band, so k=2 is kept as the
+measured median rather than as a decisive winner.
 
 **512K is faster than 1M.** Dropping 1M → 512K frees 17.7 GiB of KV. That RAM does not show
 up as "free" — it becomes page cache for the PLE table — and decode gets faster for it. Note
 the effect does not scale down linearly: pinning the KV pool later returned a further
 1.6 GiB and produced no measurable gain, so page cache is not a lever you can keep pulling.
+
+## Where the decode time actually goes
+
+A torch profiler trace of ~117 decode steps attributes GPU time as:
+
+| | share |
+|---|---|
+| dense bf16 GEMM (`cutlass_80_wmma` 55% + batch-1 lm_head gemv 18%) | **73%** |
+| MoE grouped GEMM | 18.7% |
+| MoE routing, QSA, GDN, hyperconnection, everything else | **< 5% combined** |
+
+Two things follow, and both contradicted what looked obvious beforehand.
+
+**The per-step PLE host↔device sync is not the bottleneck.** It is the natural suspect —
+the offload gathers on CPU and the GPU waits on a `cuStreamWaitValue32` every step, and
+independent write-ups have called removing it the obvious next optimisation. Forcing the
+connector down its existing dummy path (a measurement-only image; the output is wrong by
+construction) changed the **step rate by 0.6%**. It is worth 0.4 ms of a 75.8 ms step.
+Throughput did rise 8% in that ablation, but only because zeroing the n-gram table makes
+the model repeat itself and repetition is *easier to draft* — an acceptance artifact, and a
+quality symptom rather than a speed gain.
+
+**vLLM already ships the fast GEMM for this model; it is gated off here twice over.**
+`models/qwen3_8_flash_next/nvidia/low_latency_gemm.py` carries a CUTE-DSL skinny GEMM with a
+per-shape plan table, but `enable_qwen38next_low_latency_gemm` returns immediately unless
+`_is_sm103()`, and every key in `QWEN38NEXT_GEMM_PLANS` is a **TP=4** local shape — its
+lm_head entry is `(62080, 2560)`, which at TP=1 is `(248320, 2560)`. So on a single Spark
+nothing matches even if the gate passes, and every bf16 linear falls back to cuBLAS's
+Ampere-era `cutlass_80_wmma` kernel.
+
+The kernel itself is fine on sm_121: `shape_dynamic_skinny_gemm.is_available()` is True and
+its results match `F.linear`. `scripts/patch-skinny-gemm-tp1.py` relaxes the gate and adds
+TP=1 plan entries whose configs were swept against cuBLAS on the real weight shapes.
+Measured per-shape, at M=1 (drafts) / M=3 (verify):
+
+| shape | per forward | M=1 | M=3 |
+|---|---|---|---|
+| `(320, 10240)` hyperconnection down | ×97 | **2.20x** | **1.92x** |
+| `(10240, 2560)` GDN in_proj | ×36 | 1.43x | 1.05x |
+| `(248320, 2560)` lm_head | ×1 | 1.40x | 1.05x |
+| `(12288, 2560)` GDN qkvz | ×12 | 1.38x | 1.06x |
+| `(6144, 2560)` QSA qkv | ×36 | 1.23x | 1.02x |
+| `(640, 2560)` indexer / MoE gate | ×108 | **0.87x** | 1.60x |
+
+`(640, 2560)` at M=1 is slower than cuBLAS and is deliberately left out of the plan. End to
+end this is worth **+6.9% on the step rate**, reproduced across three boots. The microbench
+predicted +17%; isolated timing loops flatter the kernel, so trust the end-to-end number.
+
+This is a patch, not a fix. It is TP=1-specific and it overrides one existing plan key, so
+do not carry it into a multi-GPU deployment. It exists because GB10 is not in vLLM's CI and
+nobody upstream appears to have one — the TP=4 plans are there because somebody tuned on a
+four-GPU box.
+
+**MoE backends are already at the best supported option.** `auto` resolves to
+`FLASHINFER_CUTLASS`; the two higher-priority backends both refuse with *"kernel does not
+support current device cuda"* on sm_121. Backend validation runs before weight loading, so a
+bad `--moe-backend` fails in about two minutes rather than thirteen.
 
 ## Configuration notes that cost real time
 
@@ -250,8 +320,12 @@ the effect does not scale down linearly: pinning the KV pool later returned a fu
 (PR #53896): under async scheduling `_prepare_ngram_context` reads the CPU token mirror
 while it still holds the optimistic `-1` placeholders that speculative decoding writes
 before acceptance is known, so the n-gram context is wrong on **every** decode step — 154 of
-154 measured bad in that report. It is a silent quality loss, not a crash: the 51B n-gram
-table is fed garbage ids and no benchmark will show it.
+154 measured bad in that report, on ROCm. It is a silent failure, not a crash: no log, no
+benchmark signal. I could not measure any output difference from the flag on this box —
+outputs did change, but a control boot with the flag *off* reproduced the same change, so
+that was boot-to-boot variation and not the flag. Absence of evidence at this measurement
+floor, not evidence of absence; the upstream code analysis is specific and there is no
+reason to want the flag.
 
 **Prefix caching needs two flags.** `--enable-prefix-caching` alone is inert on this model:
 `mamba_cache_mode` defaults to `"none"` and nothing promotes it, so the GDN state is never
@@ -289,12 +363,16 @@ sudo chmod 600 /swap-ple.img
 sudo mkswap /swap-ple.img
 sudo swapon -p 10 /swap-ple.img
 
-# 3. engine
+# 3. engine, plus the TP=1 skinny-GEMM patch (worth +6.9% on the step rate)
 docker pull vllm/vllm-openai:qwen38-flash-next-arm64-cu130
+docker build -t vllm-skinny-tp1:v1 -f scripts/Dockerfile.skinny-gemm scripts/
 
 # 4. serve
 ./scripts/serve.sh
 ```
+
+`serve.sh` defaults to the patched image. `VLLM_IMAGE=vllm/vllm-openai:qwen38-flash-next-arm64-cu130 ./scripts/serve.sh`
+runs the stock one if you would rather not carry the patch.
 
 Expect roughly 10 minutes of weight loading and a further ~3 minutes of PLE paging before
 the API answers. The PLE worker loads and swaps out first; the GPU worker follows.
@@ -320,9 +398,14 @@ BENCH_MODEL=qwen3.8-flash-next python3 scripts/bench-prefill.py   # prefill tok/
 
 This is not an optimized configuration. Things that are open:
 
-- **Decode is slow for a 6B-active model.** ~30 tok/s against a bandwidth ceiling near 90.
-  The per-step CPU→GPU PLE round trip is the leading suspect but has not been isolated
-  with a profiler.
+- **Decode is still slow for a 6B-active model.** ~33 tok/s against a bandwidth ceiling near
+  90. It is now profiled rather than guessed at: 73% of decode GPU time is dense bf16 GEMM,
+  and the part of that reachable without touching kernels has been taken. What is left needs
+  either quantised attention/GDN weights (a checkpoint that does not exist, and a quality
+  question), or upstream kernel work.
+- **The skinny-GEMM configs were swept coarsely.** A finer grid over
+  `block_size x outputs_per_block x k_unroll x vector_width`, and a second look at
+  `(640, 2560)` at M=1, could plausibly find more.
 - **FP8 KV is not enabled**, and enabling it is a kernel project, not a flag. The stock
   tree refuses it in four places — `supported_kv_cache_dtypes = ["auto", "bfloat16"]` in
   both `nvidia/qsa.py:70` and `common/qsa_cache.py:658`, plus two `NotImplementedError`s
@@ -353,7 +436,12 @@ This is not an optimized configuration. Things that are open:
   for thinking mode. It was chosen for measurement stability, not quality.
 - **Boot-to-boot sequence variation is unexplained.** Identical configurations sometimes
   generate a different continuation, which moves decode throughput by ~10% through
-  acceptance length. Ruled out: executor choice, KV pool size, prefix caching, the image.
+  acceptance length. Within a boot the engine is bit-deterministic at `temperature=0`.
+  Ruled out: executor choice, KV pool size, prefix caching, the image, `--async-scheduling`,
+  and torch.compile (`inductor_compile_config` is empty, so no max_autotune, and the model's
+  own Triton kernels carry zero `@triton.autotune` — compilation is deterministic and
+  persisting its cache would not help). Not ruled out: allocation alignment, cuBLAS
+  first-call algorithm selection.
 - **Nothing here is profiled.** The per-step CPU→GPU PLE round trip is the leading suspect
   for decode being ~30 tok/s against a ~90 tok/s bandwidth ceiling, but that is an
   inference from the arithmetic, not a measurement.
