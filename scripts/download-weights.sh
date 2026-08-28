@@ -36,29 +36,45 @@ DEST="${DEST:-${MODELS_DIR:-$HOME/models}/qwen3.8-flash-next-nvfp4}"
 BASE="https://huggingface.co/${REPO}/resolve/main"
 mkdir -p "$DEST" || exit 1
 
+# size AND lfs.sha256: a size-correct but truncated/corrupt shard loads cleanly, reports
+# sane shapes, produces correct-magnitude activations, and yields fluent garbage that
+# survives every configuration change. Someone lost a day to exactly that on this model.
 manifest=$(curl -sL "https://huggingface.co/api/models/${REPO}?blobs=true" | python3 -c "
 import sys, json
 for f in json.load(sys.stdin).get('siblings', []):
     n = f['rfilename']
     if n.startswith('.'):
         continue
-    print(n, f.get('size') or 0)
+    lfs = f.get('lfs') or {}
+    print(n, f.get('size') or 0, lfs.get('sha256') or '-')
 ")
 
 [[ -z "$manifest" ]] && { echo 'FATAL: could not read file manifest' >&2; exit 1; }
 
+verify() {   # $1 path  $2 expected size  $3 expected sha256 ("-" to skip)
+    [[ -f "$1" ]] || return 1
+    [[ "$(stat -c %s "$1")" == "$2" ]] || return 1
+    [[ "$3" == "-" ]] && return 0
+    [[ "$(sha256sum "$1" | cut -d" " -f1)" == "$3" ]]
+}
+
 fail=0
-while read -r name size; do
+while read -r name size sha; do
     [[ -z "$name" ]] && continue
     out="${DEST}/${name}"
     mkdir -p "$(dirname "$out")"
-    if [[ -f "$out" ]] && [[ "$(stat -c %s "$out")" == "$size" ]]; then
+    if verify "$out" "$size" "$sha"; then
         printf '  ok    %s\n' "$name"
         continue
     fi
+    if [[ -f "$out" ]] && [[ "$(stat -c %s "$out")" == "$size" ]]; then
+        printf '  BAD   %s (size matches, sha256 does not) -- refetching\n' "$name" >&2
+        rm -f "$out"
+    fi
     printf '  get   %s (%.2f GiB)\n' "$name" "$(echo "$size" | awk '{print $1/1073741824}')"
     curl -fL -C - --retry 5 --retry-delay 5 --retry-all-errors --no-progress-meter \
-         -o "$out" "${BASE}/${name}" || { echo "  FAIL  $name" >&2; fail=1; }
+         -o "$out" "${BASE}/${name}" || { echo "  FAIL  $name" >&2; fail=1; continue; }
+    verify "$out" "$size" "$sha" || { echo "  FAIL  $name (verification failed after download)" >&2; fail=1; }
 done <<< "$manifest"
 
 echo

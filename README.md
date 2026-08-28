@@ -121,19 +121,17 @@ executor on its own and the bug is invisible.
 
 ## Which checkpoint
 
-Only one of the three candidates loads. This is worth knowing before you spend hours on a
-download.
-
-| Checkpoint | Size | PLE dtype | Loads? |
+| Checkpoint | Size | PLE dtype | Loads on stock vLLM? |
 |---|---|---|---|
 | `Inferact/Qwen3.8-Flash-Next-NVFP4` | 170.3 GiB | BF16 (95.4 GiB) | **yes** |
-| `RadixArk/Qwen3.8-Flash-Next-NVFP4` | 126.0 GiB | FP8 (47.7 GiB) | no |
-| `Qwen/Qwen3.8-Flash-Next-FP8` | 172.8 GiB | FP8 | body alone is ~125 GiB |
+| `RadixArk/Qwen3.8-Flash-Next-NVFP4` | 126.0 GiB | FP8 (47.7 GiB) | no — one `isinstance` gate |
+| `Qwen/Qwen3.8-Flash-Next-FP8` | 172.8 GiB | FP8 | body alone is ~125 GiB, does not fit |
 
-RadixArk looks strictly better — 44 GiB less to download and half the swap — and its PLE
-is a faithful quantization of the official BF16 table (cosine 0.9996, verified by another
-operator against the source rows). It is rejected because vLLM selects its FP8 PLE path
-only for an `Fp8Config` checkpoint:
+This setup runs **Inferact**, which is also what the vLLM recipe recommends, because it loads
+with no source changes. But if you are downloading fresh, know what the second row actually
+costs you, because two earlier versions of this table — including mine — got it wrong.
+
+**RadixArk loads and serves correctly.** The blocker is one line:
 
 ```python
 # vllm/models/qwen3_8_flash_next/nvidia/ple_layer.py
@@ -143,22 +141,31 @@ def _get_ple_embedding_quant_method(quant_config, prefix):
         return None
 ```
 
-RadixArk is `modelopt`/NVFP4, so the PLE would be built unquantized and its FP8 tensors
-would not load into a BF16 parameter. Qwen's own FP8 build has the PLE that path wants,
-but a ~125 GiB body that does not fit at all.
+RadixArk ships the PLE in exactly the format that method implements — F8_E4M3 shards plus one
+global BF16 `ngram_embedding.weight_scale` — but its *body* is NVFP4, so `quant_config` is
+`modelopt_fp4` and the gate rejects it on the body's format rather than the PLE's. Accepting
+`modelopt`/`modelopt_fp4` there is enough; [another GB10 operator confirmed a correct,
+coherent serve](../../issues/1) that way, at 76.61 GiB resident. That is **44 GiB less to
+download and half the swap** than the row above.
 
-**Correction, 2026-08-27:** RadixArk *does* load if that gate is widened to accept
-modelopt — but it then emits garbage, which is still being bisected
-([issue #1](../../issues/1), with ~20 hypotheses eliminated there and here). So the
-practical answer is unchanged, but "does not load" was the wrong reason. The one isolated
-difference found so far: RadixArk excludes `*.self_attn.*` as a wildcard, leaving the QSA
-`q/k/v/o_proj` in BF16, while Inferact quantizes them and excludes only 117 `self_attn`
-norm/indexer sub-modules. That accounts for the full 2.5 B-parameter gap between the two
-bodies, though it is the wrong direction to explain corruption on its own.
+Two traps on that path, both from the same report:
 
-So: **Inferact**, which is also what the vLLM recipe recommends.
+- **It fails silently if the GPU-side process registers `weight`/`weight_scale`.** Under PLE
+  CPU offload only `_offload_weight_scale` is filled, so a registered-but-unloaded
+  `weight_scale` shadows it and the lookup dequantizes against an uninitialised value —
+  fluent garbage, no error. Hand the FP8 method out only inside the offload process.
+- **`--cap-add=SYS_PTRACE` may be needed in Docker.** `PleOffloadWorker` passes CUDA tensors
+  over IPC and `rebuild_cuda_tensor` needs `pidfd_getfd`, which the default seccomp profile
+  denies; it surfaces ten minutes in as `Engine core initialization failed. Failed core
+  proc(s): {}`. This setup has not hit it — `serve.sh` runs with `--ipc host` and
+  `--cap-add=IPC_LOCK` — but add it if you see that error.
 
----
+And one that is not about the checkpoint at all: a **size-correct but corrupt shard loads
+cleanly, reports sane shapes, produces correct-magnitude activations, and yields garbage that
+survives every configuration change.** Twenty hypotheses were eliminated against corrupt
+weights before anyone checked hashes. Verify `lfs.sha256` from the HF API, not file size.
+`scripts/download-weights.sh` checks both, and refetches a shard whose size matches but whose
+hash does not.
 
 ## KV is unusually cheap
 
